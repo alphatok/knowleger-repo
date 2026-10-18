@@ -1,0 +1,9 @@
+# 生成物（想发布到 GitHub Pages 就删掉这一行）
+docs/
+
+# Python
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
