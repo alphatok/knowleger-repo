@@ -6,3 +6,7 @@
 {"ts":"2026-10-17T22:35:00+08:00","action":"create","note":"knowledge/商业/净收入留存率.md","from":["inbox/archive/2026-10-17.md"],"agent":"opencode"}
 {"ts":"2026-10-17T22:36:00+08:00","action":"create","note":"knowledge/商业/PLG 与 SLG.md","from":["inbox/archive/2026-10-17.md"],"agent":"opencode"}
 {"ts":"2026-10-17T22:37:00+08:00","action":"archive","from":"inbox/2026-10-17.md","to":"inbox/archive/2026-10-17.md","agent":"opencode"}
+{"ts":"2026-10-18T10:38:57+08:00","action":"create","note":"knowledge/方法论/知识是生产资料，不是收藏品.md","from":["inbox/2026-10-18.md"],"agent":"opencode"}
+{"ts":"2026-10-18T10:38:57+08:00","action":"create","note":"knowledge/灵感/为 kb 添加 find 全文检索命令.md","from":["inbox/2026-10-18.md"],"agent":"opencode"}
+{"ts":"2026-10-18T10:38:57+08:00","action":"conflict","note":"review/2026-10-18-HNSW-并入还是独立.md","from":["inbox/2026-10-18.md"],"agent":"opencode"}
+{"ts": "2026-10-18T10:39:07+08:00", "action": "archive", "from": "inbox/2026-10-18.md", "to": "inbox/archive/2026-10-18.md"}
