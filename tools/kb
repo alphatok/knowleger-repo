@@ -12,11 +12,14 @@ kb — knowleger-repo 命令行工具
   kb add <文本>          采集零星片段到收集箱
   kb new <分类> <标题>   手动新建一篇结构化笔记（也可由 AI 调用）
   kb status              收集箱积压 / 知识库规模 / 健康度 / 上次整理
-  kb process             输出 AI 整理任务（协议 + 待处理片段）
+  kb process             生成 Ingest 任务（可 --run 交给 AI，--local 交给本地模型）
+  kb ask <问题>          生成 Query 任务（先检索、再引用作答、回写成页）
   kb archive [文件...]   把已整理的片段归档（永不删除）
-  kb index               重建主题地图 MOC（maps/）
+  kb index               重建主题地图 MOC，并刷新本地检索索引
   kb lint                知识体检（断链 / 孤儿 / 缺字段 / 积压）
-  kb find <关键词>       全文搜索（收集箱 + 知识库 + review）
+  kb find <关键词>       本地检索（QMD 混合检索，无 QMD 时退化为全文匹配）
+  kb pattern <名字>      用 fabric 的 pattern 处理文本
+  kb doctor              检查本地工具链（ollama / qmd / fabric / AI CLI）
   kb build               生成静态站点到 docs/
   kb log [-n N]          查看整理台账
 """
@@ -27,6 +30,7 @@ import html
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -179,6 +183,73 @@ def append_ledger(entry: dict):
     with LEDGER.open("a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
+# ---------------------------------------------------------------- 外部工具
+
+CONFIG_FILE = ROOT / ".kbconfig.json"
+DEFAULT_CONFIG = {
+    "agent_cmd": "opencode run",
+    "local_model": "qwen3:8b",
+    "local_agent_cmd": "ollama run {model}",
+}
+
+def load_config() -> dict:
+    cfg = dict(DEFAULT_CONFIG)
+    if CONFIG_FILE.exists():
+        try:
+            cfg.update(json.loads(read(CONFIG_FILE)))
+        except json.JSONDecodeError:
+            print(YEL(f"⚠ {rel(CONFIG_FILE)} 不是合法 JSON，已忽略"))
+    return cfg
+
+def have(cmd: str) -> bool:
+    return shutil.which(cmd) is not None
+
+def run_capture(argv, timeout=None):
+    """返回 (returncode, stdout, stderr)。"""
+    try:
+        p = subprocess.run([str(a) for a in argv], cwd=str(ROOT),
+                           capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout, p.stderr
+    except FileNotFoundError:
+        return 127, "", f"找不到命令：{argv[0]}"
+    except subprocess.TimeoutExpired:
+        return 124, "", "超时"
+
+def run_stream(argv):
+    try:
+        return subprocess.call([str(a) for a in argv], cwd=str(ROOT))
+    except FileNotFoundError:
+        return 127
+
+QMD_DIR = ROOT / ".qmd"
+
+def qmd_ready() -> bool:
+    return have("qmd") and QMD_DIR.exists()
+
+def qmd_search(kw: str, mode: str, limit: int):
+    """mode: lex | vec | hybrid。返回 (results, error)。"""
+    sub = {"lex": "search", "vec": "vsearch", "hybrid": "query"}[mode]
+    rc, out, err = run_capture(["qmd", sub, kw, "--json", "-n", str(limit)], timeout=300)
+    if rc != 0:
+        return None, (err or out or "").strip()[:300] or f"qmd {sub} 退出码 {rc}"
+    try:
+        return json.loads(out), None
+    except json.JSONDecodeError:
+        return None, "无法解析 qmd 的 JSON 输出"
+
+def qmd_refresh():
+    """让 QMD 重新索引（增量），失败静默返回 False。"""
+    if not qmd_ready():
+        return False
+    rc, _, _ = run_capture(["qmd", "update"], timeout=300)
+    return rc == 0
+
+def qmd_embed():
+    if not qmd_ready():
+        return False
+    rc, _, _ = run_capture(["qmd", "embed"], timeout=1800)
+    return rc == 0
+
 # ---------------------------------------------------------------- 断链解析
 
 WIKI_RE = re.compile(r"\[\[([^\]|]+)(?:\|([^\]]+))?\]\]")
@@ -300,6 +371,71 @@ def cmd_status(args):
 
 # ---------------------------------------------------------------- 命令：process
 
+def available_ollama_models():
+    if not have("ollama"):
+        return []
+    rc, out, _ = run_capture(["ollama", "list"])
+    if rc != 0:
+        return []
+    return [l.split()[0] for l in out.splitlines()[1:] if l.strip()]
+
+def pick_local_model(cfg):
+    """返回 (模型名, 提示语)。配置的模型不在本地时，自动退到第一个可用模型。"""
+    want = cfg["local_model"]
+    models = available_ollama_models()
+    if not models:
+        return want, "没有检测到本地模型：先 `brew services start ollama`，再 `ollama pull " + want + "`"
+    if want in models:
+        return want, ""
+    return models[0], f"配置的 {want} 不在本地，自动改用 {models[0]}"
+
+def dispatch_agent(prompt: str, local: bool = False, tag: str = "task") -> int:
+    """把任务书交给 AI 执行。
+
+    非 local：调用 AI CLI（默认 `opencode run`），它有文件权限，会真正落盘。
+    local  ：调用本地模型（Ollama）。本地模型没有文件工具，只会产出「草稿」，
+             存到 .kb-out/ 供你或大模型二次应用。价值在于零成本的初筛/打标/判重。
+    """
+    cfg = load_config()
+    if local:
+        model, note = pick_local_model(cfg)
+        if note:
+            print(YEL(f"⚠ {note}"))
+        tmpl = os.environ.get("KB_LOCAL_CMD", cfg["local_agent_cmd"])
+        cmd = tmpl.format(model=model)
+    else:
+        cmd = os.environ.get("KB_AGENT_CMD", cfg["agent_cmd"])
+    argv = cmd.split()
+    if not argv:
+        print(RED("✗ 未配置 agent 命令")); return 1
+    if not have(argv[0]):
+        print(RED(f"✗ 找不到命令 `{argv[0]}`"))
+        print(DIM("  · 安装 opencode，或改 .kbconfig.json 的 agent_cmd"))
+        print(DIM("  · 或改用 --local 走本地 Ollama（零 API 成本，产出草稿）"))
+        return 1
+    print(DIM(f"$ {cmd} <任务书 {len(prompt)} 字符>"))
+
+    if local:
+        try:
+            p = subprocess.run(argv, cwd=str(ROOT), input=prompt,
+                               capture_output=True, text=True)
+        except FileNotFoundError:
+            print(RED("✗ 找不到本地模型命令")); return 1
+        if p.returncode != 0 and not (p.stdout or "").strip():
+            print(RED(f"✗ 本地模型失败：{(p.stderr or '').strip()[:300]}"))
+            return p.returncode
+        out = (p.stdout or "").strip()
+        print(out if out else DIM("（模型没有输出）"))
+        if out:
+            outdir = ROOT / ".kb-out"
+            outdir.mkdir(exist_ok=True)
+            fn = outdir / f"{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}-{tag}-draft.md"
+            write(fn, f"<!-- 本地模型 {model} 生成的草稿，尚未应用进知识库 -->\n\n{out}\n")
+            print(DIM(f"\n（草稿已存 {rel(fn)}。本地模型没有文件权限，"
+                      f"需要你或大模型把它应用进 knowledge/）"))
+        return 0
+    return run_stream(argv + [prompt])
+
 def cmd_process(args):
     pending = count_inbox()
     if not pending:
@@ -307,18 +443,28 @@ def cmd_process(args):
         return 0
 
     parts = []
-    parts.append("# AI 整理任务\n")
-    parts.append("请严格按仓库根目录 `AGENTS.md` 定义的「整理协议」执行以下工作：\n")
+    parts.append("# AI 整理任务（Ingest）\n")
+    parts.append("请严格按仓库根目录 `AGENTS.md` 第 4.1 节「Ingest 工作流」执行。\n")
     parts.append("## 待整理的收集箱文件\n")
     for p, n in pending:
         parts.append(f"### {rel(p)}（{n} 条片段）\n")
         parts.append(read(p).strip() + "\n")
+
+    parts.append("\n## 知识库现有笔记（判重参考，**不要重复创建**）\n")
+    existing = [(str(fm.get("category", "")), note_title(p, fm)) for p, fm, _ in iter_notes()]
+    if existing:
+        for cat, t in existing:
+            parts.append(f"- {cat} / {t}")
+    else:
+        parts.append("（暂无）")
+
     parts.append("\n## 交付要求\n")
     parts.append("1. 拆成原子笔记写入 `knowledge/<分类>/`，frontmatter 字段齐全")
-    parts.append("2. 用 `[[标题]]` 建立双向链接，更新 `maps/` 主题地图")
+    parts.append("2. 用 `[[标题]]` 建立**双向**链接，更新 `maps/` 主题地图")
     parts.append("3. 把「原始片段 → 生成笔记」的对应关系追加到 `meta/ledger.jsonl`")
     parts.append("4. 拿不准的（重复/矛盾）写进 `review/`，不要擅自合并")
-    parts.append(f"5. 处理完运行 `kb archive` 归档原始片段，再 `kb index && kb build`\n")
+    parts.append("5. 处理完运行 `kb archive` 归档原始片段，再 `kb index && kb lint && kb build`")
+    parts.append("6. 最后 git commit，让这次整理成为可回滚的 diff\n")
 
     prompt = "\n".join(parts)
 
@@ -327,19 +473,11 @@ def cmd_process(args):
         print(GRN(f"✓ 整理任务已写出到 {args.out}"))
         return 0
 
-    if not args.run:
-        print(prompt)
-        return 0
+    if args.run or args.local:
+        return dispatch_agent(prompt, local=args.local, tag="ingest")
 
-    # --run：交给 AI agent 执行
-    cmd = os.environ.get("KB_AGENT_CMD", "opencode run")
-    argv = cmd.split() + [prompt]
-    print(DIM(f"$ {cmd} <整理任务，{len(prompt)} 字符>"))
-    try:
-        return subprocess.call(argv, cwd=str(ROOT))
-    except FileNotFoundError:
-        print(RED(f"✗ 找不到命令 `{cmd}`。可设置环境变量 KB_AGENT_CMD 指定你的 AI CLI。"))
-        return 1
+    print(prompt)
+    return 0
 
 # ---------------------------------------------------------------- 命令：archive
 
@@ -409,7 +547,7 @@ def cmd_index(args):
     out = [AUTOGEN, "# 知识地图总览", ""]
     out.append(f"> 共 {len(notes)} 篇笔记 · {len(by_cat)} 个分类\n")
     for cat, items in sorted(by_cat.items()):
-        out.append(f"## [[地图 · {cat}]]（{len(items)}）")
+        out.append(f"## [[{cat}|地图 · {cat}]]（{len(items)}）")
         names = "、".join(f"[[{n['title']}]]" for n in sorted(items, key=lambda x: x["title"]))
         out.append(names)
         out.append("")
@@ -428,6 +566,14 @@ def cmd_index(args):
     write(MAPS / "00-总览.md", "\n".join(out))
 
     print(GRN(f"✓ 已重建 {len(by_cat) + 1} 个地图文件到 maps/"))
+    if qmd_ready():
+        if qmd_refresh():
+            print(DIM("  · 本地检索索引已刷新（qmd update）"))
+            if args.embed:
+                print(DIM("  · 正在重建向量索引（qmd embed）…"))
+                print(GRN("  · 向量索引已更新") if qmd_embed() else YEL("  · 向量索引更新失败"))
+        else:
+            print(YEL("  · 注意：qmd update 失败，检索索引可能未更新"))
     return 0
 
 # ---------------------------------------------------------------- 命令：lint
@@ -490,8 +636,7 @@ def cmd_lint(args):
 
 # ---------------------------------------------------------------- 命令：find
 
-def cmd_find(args):
-    kw = args.keyword
+def grep_find(kw, args):
     kl = kw.lower()
     scope = [KNOWLEDGE, INBOX, REVIEW]
     hits = 0
@@ -512,10 +657,219 @@ def cmd_find(args):
                 print(f"  {DIM(str(ln).rjust(4))}  {hl[:160]}")
             if len(matched) > args.max:
                 print(DIM(f"       … 另有 {len(matched) - args.max} 处"))
-    if not hits:
+    return hits
+
+def print_qmd_results(results, kw):
+    shown = 0
+    for r in results:
+        f = re.sub(r"^qmd://[^/]+/", "", str(r.get("file", "")))
+        line = r.get("line")
+        score = r.get("score")
+        shown += 1
+        head = BOLD(f) + (DIM(f":{line}") if line else "")
+        if isinstance(score, (int, float)):
+            head += "  " + CYA(f"{round(score * 100)}%")
+        print(f"\n{head}")
+        for s in (r.get("snippet") or "").splitlines():
+            s = s.strip()
+            if not s or s.startswith("@@"):
+                continue
+            hl = re.sub(re.escape(kw), lambda m: MAG(m.group(0)), s, flags=re.I)
+            print(f"  {hl[:200]}")
+    return shown
+
+def cmd_find(args):
+    kw = args.keyword
+
+    if args.engine == "grep":
+        n = grep_find(kw, args)
+        if not n:
+            print(YEL(f"没有找到「{kw}」")); return 1
+        print(DIM(f"\n命中 {n} 个文件（全文匹配）"))
+        return 0
+
+    if not qmd_ready():
+        print(YEL("⚠ QMD 未就绪（未安装，或缺少索引）。装好并运行 `qmd init && qmd collection add .` 即可启用。"))
+        print(DIM("  本次回退到全文匹配。\n"))
+        n = grep_find(kw, args)
+        if not n:
+            print(YEL(f"没有找到「{kw}」")); return 1
+        print(DIM(f"\n命中 {n} 个文件（全文匹配）"))
+        return 0
+
+    mode = "hybrid" if args.deep else ("vec" if args.semantic else "lex")
+    results, err = qmd_search(kw, mode, args.max)
+    if err:
+        print(YEL(f"⚠ QMD 检索失败：{err}"))
+        print(DIM("  本次回退到全文匹配。\n"))
+        n = grep_find(kw, args)
+        return 0 if n else 1
+
+    shown = print_qmd_results(results, kw)
+    if not shown:
         print(YEL(f"没有找到「{kw}」"))
         return 1
-    print(DIM(f"\n命中 {hits} 个文件"))
+    label = {"lex": "BM25 关键词", "vec": "向量语义", "hybrid": "混合检索 + 重排"}[mode]
+    print(DIM(f"\n引擎：QMD · {label} · {shown} 条"))
+    if mode != "hybrid":
+        print(DIM("  加 --deep 用混合检索+重排，--semantic 用纯语义，--grep 用全文匹配"))
+    return 0
+
+# ---------------------------------------------------------------- 命令：ask
+
+def cmd_ask(args):
+    q = args.question
+    ctx = ""
+    if qmd_ready():
+        mode = "lex" if args.fast else "hybrid"
+        results, err = qmd_search(q, mode, args.context)
+        if err and mode == "hybrid":
+            results, err = qmd_search(q, "vec", args.context)
+        if results:
+            header = []
+            seen = set()
+            for r in results:
+                f = re.sub(r"^qmd://[^/]+/", "", str(r.get("file", "")))
+                if f and f not in seen:
+                    seen.add(f)
+                    header.append(f"### {f}")
+                    body = (r.get("snippet") or "").strip()
+                    header.append("\n".join(l for l in body.splitlines() if l.strip() and not l.startswith("@@")))
+                    header.append("")
+            ctx = "\n".join(header)
+
+    parts = ["# AI 问答任务\n",
+             "请按 `AGENTS.md` 第 4.2 节「Query 工作流」执行：**先检索、再带引用作答、把有价值的答案回写成页**。\n",
+             f"## 问题\n\n{q}\n"]
+    if ctx:
+        parts.append("## 自动检索到的相关材料（本地 QMD 检索，非全部）\n")
+        parts.append(ctx + "\n")
+    else:
+        parts.append("## 自动检索\n\n（QMD 未就绪，请改用 `kb find` 或直接读 `maps/00-总览.md` 自行定位）\n")
+    parts.append("## 交付要求\n")
+    parts.append("1. 每个事实性结论都要能指回某篇笔记或某个 sources；知识库答不了就直说，不要编造")
+    parts.append("2. 若答案有复用价值 → 用 `kb new` 落成新页或在已有页追加小节（台账 `from` 写 `query:<问题摘要>`）")
+    parts.append("3. 收尾：`kb index && kb lint && kb build` 后 git commit\n")
+
+    prompt = "\n".join(parts)
+
+    if args.out:
+        write(Path(args.out), prompt)
+        print(GRN(f"✓ 问答任务已写出到 {args.out}"))
+        return 0
+
+    if args.run or args.local:
+        return dispatch_agent(prompt, local=args.local, tag="query")
+
+    print(prompt)
+    return 0
+
+# ---------------------------------------------------------------- 命令：pattern
+
+def cmd_pattern(args):
+    if not have("fabric"):
+        print(RED("✗ 未安装 fabric。安装：从 github.com/danielmiessler/fabric/releases 下载对应平台二进制。"))
+        return 1
+    if args.list:
+        rc, out, err = run_capture(["fabric", "-l"])
+        print(out or err)
+        return rc
+    text = args.text
+    if not text and args.file:
+        text = read(Path(args.file))
+    if not text:
+        text = sys.stdin.read()
+    text = (text or "").strip()
+    if not text:
+        print(RED("✗ 没有输入文本")); return 1
+    argv = ["fabric", "--pattern", args.name]
+    if args.model:
+        argv += ["--model", args.model]
+    if args.stream:
+        argv.append("--stream")
+    # fabric 从 stdin 读；但它的 CLI 也接受管道。统一走 stdout 捕获再回显。
+    try:
+        p = subprocess.run(argv, cwd=str(ROOT), input=text, text=True,
+                           capture_output=True, timeout=args.timeout)
+    except FileNotFoundError:
+        print(RED("✗ 找不到 fabric")); return 1
+    except subprocess.TimeoutExpired:
+        print(RED("✗ fabric 超时")); return 1
+    if p.returncode != 0:
+        print(RED(f"✗ fabric 失败：{(p.stderr or '').strip()[:400]}"))
+        return p.returncode
+    print(p.stdout)
+    if not args.no_save and p.stdout.strip():
+        outdir = ROOT / ".kb-out"
+        outdir.mkdir(exist_ok=True)
+        fn = outdir / f"{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}-{args.name}.md"
+        write(fn, f"<!-- fabric pattern: {args.name} -->\n\n" + p.stdout.strip() + "\n")
+        print(DIM(f"\n（已另存：{rel(fn)}）"))
+    return 0
+
+# ---------------------------------------------------------------- 命令：doctor
+
+def cmd_doctor(args):
+    cfg = load_config()
+    print(BOLD("knowleger-repo · 本地工具链自检"))
+    print(DIM("─" * 52))
+
+    def line(name, ok, detail="", hint=""):
+        mark = GRN("✓") if ok else YEL("○")
+        print(f"{mark} {name.ljust(12)} {detail}")
+        if not ok and hint:
+            print(f"  {DIM('→ ' + hint)}")
+
+    line("python3", True, sys.version.split()[0])
+    line("git", have("git"), "已安装" if have("git") else "未安装", "brew install git")
+
+    # ollama
+    if have("ollama"):
+        rc, out, _ = run_capture(["ollama", "list"])
+        models = [l.split()[0] for l in out.splitlines()[1:] if l.strip()] if rc == 0 else []
+        running = rc == 0
+        line("ollama", running, ("运行中，模型：" + ", ".join(models)) if models
+             else ("已安装但无模型" if running else "已安装但服务未启动"),
+             "brew services start ollama && ollama pull " + cfg["local_model"])
+    else:
+        line("ollama", False, "未安装", "brew install ollama")
+
+    # qmd
+    if have("qmd"):
+        rc, out, _ = run_capture(["qmd", "status"])
+        files = re.search(r"Total:\s*(\d+)", out)
+        vecs = re.search(r"Vectors:\s*(\d+)", out)
+        if QMD_DIR.exists():
+            line("qmd", True,
+                 f"索引就绪（{files.group(1) if files else '?'} 文件 / {vecs.group(1) if vecs else '0'} 向量）")
+        else:
+            line("qmd", False, "已安装，但本仓库还没建索引",
+                 "qmd init && qmd collection add . && qmd embed")
+    else:
+        line("qmd", False, "未安装", "npm install -g @tobilu/qmd")
+
+    # fabric
+    if have("fabric"):
+        rc, out, _ = run_capture(["fabric", "-l"])
+        n = len([l for l in out.splitlines() if l.strip()])
+        line("fabric", n > 0, f"已安装，{n} 个 pattern" if n else "已安装但无 pattern",
+             "fabric --updatepatterns")
+    else:
+        line("fabric", False, "未安装",
+             "从 github.com/danielmiessler/fabric/releases 下载二进制，或 go install github.com/danielmiessler/fabric@latest")
+
+    # AI CLI
+    agent = cfg["agent_cmd"].split()[0]
+    line("AI CLI", have(agent), f"{cfg['agent_cmd']}",
+         "安装 opencode，或在 .kbconfig.json 里改 agent_cmd")
+
+    print(DIM("─" * 52))
+    eff, note = pick_local_model(cfg)
+    print(f"检索引擎：{BOLD('QMD ' + ('可用' if qmd_ready() else '不可用'))}    "
+          f"本地模型：{BOLD(eff)}  {DIM('(来自 .kbconfig.json)')}")
+    if note:
+        print(YEL(f"  ⚠ {note}"))
+    print(DIM("提示：kb process --local 用本地模型跑整理，零 API 成本。"))
     return 0
 
 # ---------------------------------------------------------------- 命令：log
@@ -793,27 +1147,56 @@ def main():
 
     sub.add_parser("status", help="知识库状态").set_defaults(func=cmd_status)
 
-    p = sub.add_parser("process", help="输出 AI 整理任务")
+    p = sub.add_parser("process", help="生成 Ingest 整理任务")
     p.add_argument("--run", action="store_true", help="直接调用 AI CLI 执行（默认 opencode run）")
+    p.add_argument("--local", action="store_true", help="用本地 Ollama 模型执行（零 API 成本）")
     p.add_argument("-o", "--out", help="把任务写到文件")
-    p.set_defaults(func=cmd_process)
+    p.set_defaults(func=cmd_process, local=False)
+
+    p = sub.add_parser("ask", help="生成 Query 问答任务（检索 + 引用作答 + 回写）")
+    p.add_argument("question")
+    p.add_argument("-n", "--context", type=int, default=6, help="自动检索多少条素材")
+    p.add_argument("--fast", action="store_true", help="用 BM25 快速检索（默认混合检索+重排）")
+    p.add_argument("--run", action="store_true", help="直接调用 AI CLI 执行")
+    p.add_argument("--local", action="store_true", help="用本地 Ollama 模型执行")
+    p.add_argument("-o", "--out", help="把任务写到文件")
+    p.set_defaults(func=cmd_ask, local=False)
+
+    p = sub.add_parser("pattern", help="用 fabric 的 pattern 处理文本")
+    p.add_argument("name", nargs="?", help="pattern 名字，如 extract_wisdom")
+    p.add_argument("text", nargs="?", help="要处理的文本；省略则从 stdin 读")
+    p.add_argument("-f", "--file", help="从文件读取")
+    p.add_argument("-l", "--list", action="store_true", help="列出所有可用 pattern")
+    p.add_argument("-m", "--model", help="指定模型")
+    p.add_argument("-s", "--stream", action="store_true", help="流式输出")
+    p.add_argument("--no-save", action="store_true", help="不另存结果")
+    p.add_argument("--timeout", type=int, default=600)
+    p.set_defaults(func=cmd_pattern)
+
+    sub.add_parser("doctor", help="检查本地工具链").set_defaults(func=cmd_doctor)
 
     p = sub.add_parser("archive", help="归档已整理的片段")
     p.add_argument("files", nargs="*")
     p.set_defaults(func=cmd_archive)
 
-    sub.add_parser("index", help="重建主题地图 MOC").set_defaults(func=cmd_index)
+    p = sub.add_parser("index", help="重建主题地图 MOC，并刷新本地检索索引")
+    p.add_argument("--embed", action="store_true", help="同时重建向量索引（qmd embed，较慢）")
+    p.set_defaults(func=cmd_index)
+
     sub.add_parser("lint", help="知识体检").set_defaults(func=cmd_lint)
 
     p = sub.add_parser("build", help="生成静态站点")
     p.add_argument("--open", action="store_true", help="生成后打开浏览器")
     p.set_defaults(func=cmd_build)
 
-    p = sub.add_parser("find", help="全文搜索（收集箱 + 知识库 + review）")
+    p = sub.add_parser("find", help="本地检索（QMD 混合检索 / 全文匹配）")
     p.add_argument("keyword")
-    p.add_argument("-n", "--max", type=int, default=5, help="每个文件最多显示几处")
-    p.add_argument("-a", "--all", action="store_true", help="连同 inbox/archive/ 一起搜")
-    p.set_defaults(func=cmd_find)
+    p.add_argument("-n", "--max", type=int, default=6, help="最多返回几条")
+    p.add_argument("-a", "--all", action="store_true", help="全文模式：连同归档一起搜")
+    p.add_argument("--deep", action="store_true", help="混合检索 + LLM 重排（质量最好，稍慢）")
+    p.add_argument("--semantic", action="store_true", help="纯向量语义检索")
+    p.add_argument("--grep", dest="engine", action="store_const", const="grep", help="强制全文匹配")
+    p.set_defaults(func=cmd_find, engine="auto")
 
     p = sub.add_parser("log", help="查看整理台账")
     p.add_argument("-n", type=int, default=20)

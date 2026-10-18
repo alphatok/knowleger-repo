@@ -1,0 +1,17 @@
+{
+  "userIgnoreFilters": [
+    "docs/",
+    "tools/",
+    ".git/"
+  ],
+  "alwaysUpdateLinks": true,
+  "useMarkdownLinks": false,
+  "newFileLocation": "folder",
+  "newFileFolderPath": "inbox",
+  "attachmentFolderPath": "attachments",
+  "trashOption": "local",
+  "showLineNumber": true,
+  "readableLineLength": true,
+  "strictLineBreaks": false,
+  "spellcheck": false
+}

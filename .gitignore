@@ -1,9 +1,27 @@
 # 生成物（想发布到 GitHub Pages 就删掉这一行）
 docs/
 
+# fabric pattern 的另存结果
+.kb-out/
+
+# QMD 本地检索索引（可重建，不入库）
+.qmd/
+
+# 附件
+attachments/
+
 # Python
 __pycache__/
 *.pyc
 
 # macOS
 .DS_Store
+
+# Obsidian：本机状态，不共享
+.obsidian/workspace.json
+.obsidian/workspace-mobile.json
+.obsidian/cache/
+.obsidian/plugins/
+.obsidian/hotkeys.json
+.obsidian/appearance.json
+.obsidian/core-plugins.json

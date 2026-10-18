@@ -1,7 +1,7 @@
 ---
-id: {{id}}
+id: {{date:YYYYMMDD}}
 title: {{title}}
-category: {{category}}
+category: 
 tags: []
 status: seed
 created: {{date}}

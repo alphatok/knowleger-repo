@@ -1,0 +1,5 @@
+{
+  "agent_cmd": "opencode run",
+  "local_model": "qwen3:8b",
+  "local_agent_cmd": "ollama run {model}"
+}
