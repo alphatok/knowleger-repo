@@ -16,6 +16,7 @@ kb — knowleger-repo 命令行工具
   kb archive [文件...]   把已整理的片段归档（永不删除）
   kb index               重建主题地图 MOC（maps/）
   kb lint                知识体检（断链 / 孤儿 / 缺字段 / 积压）
+  kb find <关键词>       全文搜索（收集箱 + 知识库 + review）
   kb build               生成静态站点到 docs/
   kb log [-n N]          查看整理台账
 """
@@ -487,6 +488,36 @@ def cmd_lint(args):
     print(DIM(f"\n共 {len(issues)} 条（{n_err} 个错误）"))
     return 1 if n_err else 0
 
+# ---------------------------------------------------------------- 命令：find
+
+def cmd_find(args):
+    kw = args.keyword
+    kl = kw.lower()
+    scope = [KNOWLEDGE, INBOX, REVIEW]
+    hits = 0
+    for base in scope:
+        if not base.exists():
+            continue
+        for p in sorted(base.rglob("*.md")):
+            if "archive" in p.parts and not args.all:
+                continue
+            lines = read(p).splitlines()
+            matched = [(i + 1, l) for i, l in enumerate(lines) if kl in l.lower()]
+            if not matched:
+                continue
+            hits += 1
+            print(f"\n{BOLD(rel(p))}  {DIM(f'({len(matched)} 处)')}")
+            for ln, line in matched[:args.max]:
+                hl = re.sub(re.escape(kw), lambda m: MAG(m.group(0)), line, flags=re.I)
+                print(f"  {DIM(str(ln).rjust(4))}  {hl[:160]}")
+            if len(matched) > args.max:
+                print(DIM(f"       … 另有 {len(matched) - args.max} 处"))
+    if not hits:
+        print(YEL(f"没有找到「{kw}」"))
+        return 1
+    print(DIM(f"\n命中 {hits} 个文件"))
+    return 0
+
 # ---------------------------------------------------------------- 命令：log
 
 def cmd_log(args):
@@ -777,6 +808,12 @@ def main():
     p = sub.add_parser("build", help="生成静态站点")
     p.add_argument("--open", action="store_true", help="生成后打开浏览器")
     p.set_defaults(func=cmd_build)
+
+    p = sub.add_parser("find", help="全文搜索（收集箱 + 知识库 + review）")
+    p.add_argument("keyword")
+    p.add_argument("-n", "--max", type=int, default=5, help="每个文件最多显示几处")
+    p.add_argument("-a", "--all", action="store_true", help="连同 inbox/archive/ 一起搜")
+    p.set_defaults(func=cmd_find)
 
     p = sub.add_parser("log", help="查看整理台账")
     p.add_argument("-n", type=int, default=20)
