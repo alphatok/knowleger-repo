@@ -11,3 +11,6 @@
 {"ts":"2026-10-18T10:38:57+08:00","action":"conflict","note":"review/2026-10-18-HNSW-并入还是独立.md","from":["inbox/2026-10-18.md"],"agent":"opencode"}
 {"ts": "2026-10-18T10:39:07+08:00", "action": "archive", "from": "inbox/2026-10-18.md", "to": "inbox/archive/2026-10-18.md"}
 {"ts": "2026-10-18T10:40:33+08:00", "action": "update", "note": "knowledge/灵感/为 kb 添加 find 全文检索命令.md", "from": ["inbox/archive/2026-10-18.md"], "agent": "opencode", "reason": "TODO 已实现，status 由 seed 修正为 evergreen，避免过时结论留在库里"}
+{"ts": "2026-10-19T13:11:06+08:00", "action": "new", "note": "knowledge/商业/股市收益的两个来源：盈利与估值.md", "agent": "opencode"}
+{"ts": "2026-10-19T13:11:35+08:00", "action": "create", "note": "knowledge/商业/股市收益的两个来源：盈利与估值.md", "from": ["inbox/2026-10-19.md"], "agent": "opencode"}
+{"ts": "2026-10-19T13:11:38+08:00", "action": "archive", "from": "inbox/2026-10-19.md", "to": "inbox/archive/2026-10-19.md"}
